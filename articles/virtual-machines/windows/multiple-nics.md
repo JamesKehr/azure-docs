@@ -238,57 +238,143 @@ Add routes for secondary NICs to the OS by completing the steps in [Configure th
 
 ## Configure guest OS for multiple NICs
 
-Azure assigns a default gateway to the first (primary) network interface attached to the virtual machine. Azure does not assign a default gateway to additional (secondary) network interfaces attached to a virtual machine. Therefore, you are unable to communicate with resources outside the subnet that a secondary network interface is in, by default. Secondary network interfaces can, however, communicate with resources outside their subnet, though the steps to enable communication are different for different operating systems.
+Azure only assigns a default gateway to the first (primary) network interface attached to a virtual machine. Azure does not assign a default gateway to additional (secondary) network interfaces. As a result you cannot, by default, communicate with resources outside the local subnet of secondary network interfaces. This section covers the basic steps needed to enable cross subnet access for Windows. 
 
-1. From a Windows command prompt, run the `route print` command, which returns output similar to the following output for a virtual machine with two attached network interfaces:
+Please refer to vendor documentation regarding route creation for any non-Windows virtual machine.
 
+1. From a PowerShell console, run the `Get-NetAdapter` command, which returns the attached network interfaces:
+
+    ```PowerShell
+    Get-NetAdapter
     ```
-    ===========================================================================
-    Interface List
-    3...00 0d 3a 10 92 ce ......Microsoft Hyper-V Network Adapter #3
-    7...00 0d 3a 10 9b 2a ......Microsoft Hyper-V Network Adapter #4
-    ===========================================================================
+    ```PowerShell
+    Name                      InterfaceDescription                    ifIndex Status       MacAddress             LinkSpeed
+    ----                      --------------------                    ------- ------       ----------             ---------
+    Ethernet 7                Microsoft Hyper-V Network Adapter #3         16 Up           60-45-BD-B3-22-C3        50 Gbps
+    Ethernet 13               Mellanox ConnectX-4 Lx Virtual Et...#10      24 Up           60-45-BD-B3-22-C3        50 Gbps
+    Ethernet 6                Microsoft Hyper-V Network Adapter #2          3 Up           60-45-BD-83-96-36        50 Gbps
     ```
  
-    In this example, **Microsoft Hyper-V Network Adapter #4** (interface 7) is the secondary network interface that doesn't have a default gateway assigned to it.
+    In this example, **Microsoft Hyper-V Network Adapter #2** (InterfaceIndex **3**, InterfaceAlias (Name) **Ethernet 6**) is the secondary network interface that does not have a default gateway assigned to it.
+    
+    The **Mellanox ConnectX...** (interface index 24) network interface is the virtual function (VF) adapter used by Azure Accelerated Networking. Do not attempt to add routes on VF adapters. Packet routing for Accelerated Networking is automatically handled by the OS.
+    
+    In this example, **Ethernet 7** uses Azure Accelerated Networking and **Ethernet 6** does not. These steps can be used regardless of the Accelerated Networking state because IP routing happens at the Hyper-V Network Adapter and not the VF adapter (Mellanox) level. 
 
-2. From a command prompt, run the `ipconfig` command to see which IP address is assigned to the secondary network interface. In this example, 192.168.2.4 is assigned to interface 7. No default gateway address is returned for the secondary network interface.
+2. From a PowerShell console, run the `Get-NetIPConfiguration -InterfaceIndex <idx>` command to see which IP address is assigned to the secondary network interface. The alias `gip` can be used as a alternate to `Get-NetIPConfiguration`.
 
-3. To route all traffic destined for addresses outside the subnet of the secondary network interface to the gateway for the subnet, run the following command:
-
+    ```PowerShell
+    Get-NetIPConfiguration -InterfaceIndex 3
     ```
-    route add -p 0.0.0.0 MASK 0.0.0.0 192.168.2.1 METRIC 5015 IF 7
+    ```PowerShell
+    InterfaceAlias       : Ethernet 6
+    InterfaceIndex       : 3
+    InterfaceDescription : Microsoft Hyper-V Network Adapter #2
+    NetProfile.Name      : Network
+    IPv6Address          : fd42:345d:af54:cc61::5
+    IPv4Address          : 10.1.1.5
+    IPv6DefaultGateway   : fe80::1234:5678:9abc
+    IPv4DefaultGateway   :
+    DNSServer            : 10.1.0.5
+                           10.1.1.5
     ```
 
-    The gateway address for the subnet is the first IP address (ending in .1) in the address range defined for the subnet. If you don't want to route all traffic outside the subnet, you could add individual routes to specific destinations, instead. For example, if you only wanted to route traffic from the secondary network interface to the 192.168.3.0 network, you enter the command:
+    Please note that the **IPv4DefaultGateway** property is blank. A default route (0.0.0.0/0) cannot be created when there is no gateway for an interface.
 
-      ```
-      route add -p 192.168.3.0 MASK 255.255.255.0 192.168.2.1 METRIC 5015 IF 7
-      ```
+
+3. Now use `Get-NetRoute -InterfaceIndex <idx>` to view the existing routes for the network interface.
+
+    ```PowerShell
+    Get-NetRoute -InterfaceIndex 3
+    ```
+    ```PowerShell
+    ifIndex DestinationPrefix                              NextHop                                  RouteMetric ifMetric PolicyStore
+    ------- -----------------                              -------                                  ----------- -------- -----------
+    3       255.255.255.255/32                             0.0.0.0                                          256 10       ActiveStore
+    3       224.0.0.0/4                                    0.0.0.0                                          256 10       ActiveStore
+    3       10.1.1.255/32                                  0.0.0.0                                          256 10       ActiveStore
+    3       10.1.1.5/32                                    0.0.0.0                                          256 10       ActiveStore
+    3       10.1.1.0/24                                    0.0.0.0                                          256 10       ActiveStore
+    3       ff00::/8                                       ::                                               256 10       ActiveStore
+    3       fe80::92e:20e8:fb:de4/128                      ::                                               256 10       ActiveStore
+    3       fe80::/64                                      ::                                               256 10       ActiveStore
+    3       fd42:345d:af54:cc61::5/128                     ::                                               256 10       ActiveStore
+    3       fd42:345d:af54:cc61::/64                       ::                                               256 10       ActiveStore
+    3       ::/0                                           fe80::1234:5678:9abc                             256 10       ActiveStore
+    ```
+
+    An IPv4 default route uses 0.0.0.0/0 as the DestinationPrefix. An operating system, Windows in this example, cannot route traffic outside the subnet when there is no route, such as the default route, pointing traffic to a gateway.
+    
+    Use `ping -S` (the -S is case sensitive) to confirm that cross subnet traffic is not working. 
+    - Replace the IP's with the appropriate address for your test.
+    - The -S parameter sets the Source address used by ping.exe.
+    
+    ```
+    ping -S 10.1.1.5 10.1.0.4
+
+    Pinging 10.1.0.4 from 10.1.1.5 with 32 bytes of data:
+    PING: transmit failed. General failure.
+    PING: transmit failed. General failure.
+    PING: transmit failed. General failure.
+    PING: transmit failed. General failure.
+    
+    Ping statistics for 10.1.0.4:
+        Packets: Sent = 4, Received = 0, Lost = 4 (100% loss),
+    ```
+    
+    Windows does not allow inbound ping (ICMP echo) by default. Use this command to allow pings.
+    
+    ```PowerShell
+    Enable-NetFirewallRule -DisplayName 'File and Printer Sharing (Echo Request - ICMPv4-In)'
+    ```
+
+4. Create routes using `New-NetRoute`. Use `Get-NetRoute` to confirm changes (see step 3).
+
+    a. Add a Default Route if you wish to send all off-subnet traffic to the gateway.
+    
+    - If the route exists, but is not working, use `Set-NetRoute` to adjust the route details.
+    - `New-NetRoute` automatically stores the new route in both the Active and Persistent route store.
+    - The `-NextHop` is the IP address of the gateway.
+
+    ```PowerShell
+    New-NetRoute -DestinationPrefix 0.0.0.0/0 -InterfaceIndex 3 -NextHop 10.1.1.1 -RouteMetric 5015
+    ```
+    ```PowerShell
+    ifIndex DestinationPrefix                              NextHop                                  RouteMetric ifMetric PolicyStore
+    ------- -----------------                              -------                                  ----------- -------- -----------
+    3       0.0.0.0/0                                      10.1.1.1                                        5015 10       ActiveStore
+    3       0.0.0.0/0                                      10.1.1.1                                        5015          Persiste...
+    ```
+
+    The gateway address for the subnet is the second IP address in the subnet. For example, if the subnet in Azure is defined as 10.1.1.0/24, the gateway IP address would be 10.1.1.1. The IP 10.1.1.0 is called the network ID or network address. If the subnet in Azure is 10.1.0.128/25, the gateway would be 10.1.0.129. The IP 10.1.0.128 would be the network ID.
+    
+    When in doubt, look at the IPv4DefaultGateway from a system that uses that subnet as the primary network interface. Or you can use a subnet calculator. 
+    
+    b. Specific routes can be used when you do not wish to route all traffic. 
+    
+      In this example, only traffic destined to 10.1.0.0/24 is routed to the gateway.
+
+    ```PowerShell
+    New-NetRoute -DestinationPrefix 10.1.0.0/24 -InterfaceIndex 3 -NextHop 10.1.1.1 -RouteMetric 5015
+    ```
   
-4. To confirm successful communication with a resource on the 192.168.3.0 network, for example, enter the following command to ping 192.168.3.4 using interface 7 (192.168.2.4):
+5. Confirm that the configuration works by using `ping -S` or the test process of your choice.
 
     ```
-    ping 192.168.3.4 -S 192.168.2.4
+    ping -S 10.1.1.5 10.1.0.4
+    
+    Pinging 10.1.0.4 from 10.1.1.5 with 32 bytes of data:
+    Reply from 10.1.0.4: bytes=32 time=1ms TTL=128
+    Reply from 10.1.0.4: bytes=32 time=1ms TTL=128
+    Reply from 10.1.0.4: bytes=32 time=1ms TTL=128
+    Reply from 10.1.0.4: bytes=32 time<1ms TTL=128
+    
+    Ping statistics for 10.1.0.4:
+        Packets: Sent = 4, Received = 4, Lost = 0 (0% loss),
+    Approximate round trip times in milli-seconds:
+        Minimum = 0ms, Maximum = 1ms, Average = 0ms
     ```
 
-    You may need to open ICMP through the Windows firewall of the device you're pinging with the following command:
-  
-      ```
-      netsh advfirewall firewall add rule name=Allow-ping protocol=icmpv4 dir=in action=allow
-      ```
-  
-5. To confirm the added route is in the route table, enter the `route print` command, which returns output similar to the following text:
-
-    ```
-    ===========================================================================
-    Active Routes:
-    Network Destination        Netmask          Gateway       Interface  Metric
-              0.0.0.0          0.0.0.0      192.168.1.1      192.168.1.4     15
-              0.0.0.0          0.0.0.0      192.168.2.1      192.168.2.4   5015
-    ```
-
-    The route listed with *192.168.1.1* under **Gateway**, is the route that is there by default for the primary network interface. The route with *192.168.2.1* under **Gateway**, is the route you added.
 
 ## Next steps
 Review [Windows VM sizes](../sizes.md) when you're trying to create a VM that has multiple NICs. Pay attention to the maximum number of NICs that each VM size supports.
